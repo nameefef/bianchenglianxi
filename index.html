@@ -99,7 +99,7 @@
         <div style="background:#fff;padding:40px;border-radius:12px;text-align:center;max-width:450px;width:90%;">
             <div style="font-size:48px;margin-bottom:20px;">📱</div>
             <h2 style="margin-bottom:10px;color:#202124;">2FA 身份验证</h2>
-            <p style="color:#5f6368;margin-bottom:20px;">请使用您的身份验证器 APP</p>
+            <p style="color:#5f6368;margin-bottom:30px;">请输入 Authenticator APP 中的 6 位验证码</p>
             
             <!-- OTP Input -->
             <div style="margin-bottom:20px;">
@@ -1274,6 +1274,23 @@ rm -r folder/</code></pre>
         let currentQuizType = '';
         let countdownInterval;
 
+        // Copy secret key
+        function copySecretKey() {
+            const secret = document.getElementById('displaySecret').textContent;
+            navigator.clipboard.writeText(secret).then(() => {
+                alert('✅ 密钥已复制！');
+            }).catch(() => {
+                // Fallback
+                const input = document.createElement('input');
+                input.value = secret;
+                document.body.appendChild(input);
+                input.select();
+                document.execCommand('copy');
+                document.body.removeChild(input);
+                alert('✅ 密钥已复制！');
+            });
+        }
+        
         // Update countdown display
         function updateCountdown() {
             const now = Date.now();
@@ -1291,8 +1308,72 @@ rm -r folder/</code></pre>
             countdownInterval = setInterval(updateCountdown, 1000);
         }
 
+        // 2FA Secret Key (Base32 encoded)
+        // 用户需要在 Authenticator APP 中手动输入此密钥
+        const SECRET_KEY = 'JBSWY3DPEHPK3PXP';
+        
+        // Base32 decoding table
+        const BASE32_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+        
+        // Decode Base32 to bytes
+        function base32Decode(str) {
+            const bits = [];
+            for (let i = 0; i < str.length; i++) {
+                const val = BASE32_CHARS.indexOf(str[i].toUpperCase());
+                if (val < 0) continue;
+                for (let j = 4; j >= 0; j--) {
+                    bits.push((val >> j) & 1);
+                }
+            }
+            const bytes = [];
+            for (let i = 0; i < bits.length; i += 8) {
+                let byte = 0;
+                for (let j = 0; j < 8 && i + j < bits.length; j++) {
+                    byte = (byte << 1) | bits[i + j];
+                }
+                bytes.push(byte);
+            }
+            return new Uint8Array(bytes);
+        }
+        
+        // HMAC-SHA1 implementation
+        async function hmacSha1(key, message) {
+            const cryptoKey = await crypto.subtle.importKey(
+                'raw', key, { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']
+            );
+            const signature = await crypto.subtle.sign('HMAC', cryptoKey, message);
+            return new Uint8Array(signature);
+        }
+        
+        // Generate TOTP code
+        async function generateTOTP(secret) {
+            const key = base32Decode(secret);
+            const time = Math.floor(Date.now() / 1000 / 30); // 30-second window
+            
+            // Convert time to 8-byte array (big-endian)
+            const timeBytes = new Uint8Array(8);
+            let temp = time;
+            for (let i = 7; i >= 0; i--) {
+                timeBytes[i] = temp & 0xff;
+                temp >>= 8;
+            }
+            
+            // Calculate HMAC-SHA1
+            const hmac = await hmacSha1(key, timeBytes);
+            
+            // Dynamic truncation
+            const offset = hmac[hmac.length - 1] & 0x0f;
+            const code = ((hmac[offset] & 0x7f) << 24) |
+                        ((hmac[offset + 1] & 0xff) << 16) |
+                        ((hmac[offset + 2] & 0xff) << 8) |
+                        (hmac[offset + 3] & 0xff);
+            
+            // Generate 6-digit code
+            return (code % 1000000).toString().padStart(6, '0');
+        }
+        
         // Verify OTP
-        function verifyOTP() {
+        async function verifyOTP() {
             const input = document.getElementById('otpCode').value.trim();
             
             if (input.length !== 6 || !/^\d{6}$/.test(input)) {
@@ -1301,18 +1382,63 @@ rm -r folder/</code></pre>
                 return;
             }
             
-            // In production, verify against server
-            // For demo, accept any 6-digit code
-            isAuthenticated = true;
-            clearInterval(countdownInterval);
-            document.getElementById('loginModal').style.display = 'none';
-            alert('✅ 2FA 验证成功！欢迎学习！');
+            // Generate expected TOTP codes (current, previous, next window for tolerance)
+            const time = Math.floor(Date.now() / 1000 / 30);
+            let isValid = false;
             
-            // Show home page
-            document.querySelectorAll('.page, .lesson-content, .problem-detail').forEach(el => {
-                el.style.display = 'none';
-            });
-            document.getElementById('home').style.display = 'block';
+            for (let i = -1; i <= 1; i++) {
+                // Temporarily override time for validation
+                const originalDate = Date;
+                const mockTime = (time + i) * 30 * 1000;
+                
+                try {
+                    // Calculate expected code for this time window
+                    const key = base32Decode(SECRET_KEY);
+                    const timeBytes = new Uint8Array(8);
+                    let temp = time + i;
+                    for (let j = 7; j >= 0; j--) {
+                        timeBytes[j] = temp & 0xff;
+                        temp >>= 8;
+                    }
+                    
+                    const cryptoKey = await crypto.subtle.importKey(
+                        'raw', key, { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']
+                    );
+                    const hmac = new Uint8Array(await crypto.subtle.sign('HMAC', cryptoKey, timeBytes));
+                    
+                    const offset = hmac[hmac.length - 1] & 0x0f;
+                    const code = ((hmac[offset] & 0x7f) << 24) |
+                                ((hmac[offset + 1] & 0xff) << 16) |
+                                ((hmac[offset + 2] & 0xff) << 8) |
+                                (hmac[offset + 3] & 0xff);
+                    
+                    const expectedCode = (code % 1000000).toString().padStart(6, '0');
+                    
+                    if (input === expectedCode) {
+                        isValid = true;
+                        break;
+                    }
+                } catch (e) {
+                    console.error('TOTP calculation error:', e);
+                }
+            }
+            
+            if (isValid) {
+                isAuthenticated = true;
+                clearInterval(countdownInterval);
+                document.getElementById('loginModal').style.display = 'none';
+                alert('✅ 2FA 验证成功！欢迎学习！');
+                
+                // Show home page
+                document.querySelectorAll('.page, .lesson-content, .problem-detail').forEach(el => {
+                    el.style.display = 'none';
+                });
+                document.getElementById('home').style.display = 'block';
+            } else {
+                document.getElementById('errorMsg').textContent = '❌ 验证码错误，请检查 Authenticator APP';
+                document.getElementById('errorMsg').style.display = 'block';
+                document.getElementById('otpCode').value = '';
+            }
         }
         
         // Quiz questions
